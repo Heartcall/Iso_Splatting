@@ -56,13 +56,13 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     for iteration in range(first_iter, opt.iterations + 1):        
 
         iter_start.record()
+        gaussians.update_learning_rate(iteration)
+        
         # --- Iso-Splatting 关键步骤 A: 几何吸附 ---
         # 在每次迭代前，强制将高斯中心“推”回 SDF 的零水平面
         # 这保证了渲染的高斯始终位于隐式定义的表面上
         if iteration > opt.warmup_iterations:
             gaussians.projection_step()
-
-        gaussians.update_learning_rate(iteration)
 
         # Every 1000 its we increase the levels of SH up to a maximum degree
         if iteration % 1000 == 0:
@@ -76,7 +76,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         # --- Iso-Splatting 关键步骤 B & C: 获取几何与光栅化 ---
         # 1. 动态获取由 SDF 决定的位置和旋转
         xyz, rotation, normals_sdf = gaussians.get_current_geometry()
-        
         # 2. 动态获取由 Texture Field 决定的颜色
         colors = gaussians.get_colors() 
         # 注意：这里需要 override 颜色，不使用 SH
@@ -88,36 +87,27 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                             override_rot=rotation, 
                             override_color=colors)
         
-        image = render_pkg["render"]
-        
+        image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
         
         gt_image = viewpoint_cam.original_image.cuda()
         Ll1 = l1_loss(image, gt_image)
         
-        # --- Iso-Splatting 关键步骤: Eikonal Loss ---
-        # 强约束 SDF 梯度模长为 1，保证它是真实的距离场
-        # 我们随机采样一些点来计算这个 Loss
+        # Eikonal Loss
         sample_points = xyz + torch.randn_like(xyz) * 0.01
         gradients = gaussians.sdf_network.gradient(sample_points)
         eikonal_loss = ((gradients.norm(2, dim=-1) - 1) ** 2).mean()
         
-        # 组合 Loss
-        # 注意：2DGS 的 normal consistency loss 这里天然满足，因为法线就是梯度
-        # 但我们依然可以加上 render_normal 和 analytical_normal 的一致性约束
         total_loss = (1.0 - opt.lambda_dssim) * Ll1 + \
                      opt.lambda_dssim * (1.0 - ssim(image, gt_image)) + \
                      0.1 * eikonal_loss
         
         total_loss.backward()
+        iter_end.record()
         
         # --- Iso-Splatting 关键步骤 D: 梯度流 ---
         # 这里的 backward 会通过 pytorch 的计算图自动流向：
         # Loss -> Rasterizer -> (xyz, rotation, colors) -> (SDF Net, Texture Net)
         # 从而利用光栅化的梯度更新隐式场
-        
-
-        iter_end.record()
-
         with torch.no_grad():
             # Progress bar
             ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
@@ -151,10 +141,18 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
             # Densification
             # Iso-Splatting 的 Densification 需要基于 SDF 误差
-            if iteration % opt.densification_interval == 0:
-                # 可以在这里补充：在 SDF 梯度大或渲染误差大的地方，沿着切平面生成新的 anchor points
-                gaussians.densify(num_new_points=opt.num_new_points_per_densification)
+            if iteration < opt.densify_until_iter:
+                gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
+                # 累积梯度统计，供 densify_and_prune 使用
+                gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
+
+                if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
+                    size_threshold = 20 if iteration > opt.opacity_reset_interval else None
+                    # 调用正确的函数，传入正确的参数
+                    gaussians.densify_and_prune(opt.densify_grad_threshold, opt.opacity_cull, scene.cameras_extent, size_threshold)
                 
+                if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
+                    gaussians.reset_opacity()
 
             # Optimizer step
             if iteration < opt.iterations:
