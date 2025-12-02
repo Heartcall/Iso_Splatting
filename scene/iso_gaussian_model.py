@@ -387,4 +387,5 @@ class IsoGaussianModel:
         attributes = np.concatenate((xyz, normals, f_dc, f_rest, opacities, scale, rotation), axis=1)
         elements[:] = list(map(tuple, attributes))
         el = PlyElement.describe(elements, 'vertex')
+
         PlyData([el]).write(path)
